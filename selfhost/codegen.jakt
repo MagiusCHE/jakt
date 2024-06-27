@@ -41,6 +41,8 @@ struct ControlFlowState {
     directly_inside_match: bool = false
     // whether any outer scope is a match IIFE
     indirectly_inside_match: bool = false
+    // whether any outer scope is try block
+    indirectly_inside_try_block: bool = false
 
     fn no_control_flow() -> ControlFlowState {
         return ControlFlowState(
@@ -193,6 +195,15 @@ struct CodegenDebugInfo {
     }
 }
 
+
+enum YieldMethod {
+    // return ExplicitValue from match.
+    // the template is for JaktInternal::Explicit
+    ReturnExplicitValue(ctor: String)
+    AssignAndGoto(name: String, label: String)
+}
+
+
 struct CodeGenerator {
 
     compiler: Compiler
@@ -211,9 +222,11 @@ struct CodeGenerator {
     generic_inferences: [TypeId:TypeId]? = None
     // Modules that this generation depends on, detected from type definitions
     used_modules: {ModuleId} = {}
+    yield_method: YieldMethod? = None
 
+    // `forward_error_with_try` controls whether errors are handled through the TRY() macro or through an external mechanism put by the caller.
     // noreturn functions may not throw, so let them crash instead.
-    fn current_error_handler(this) -> String {
+    fn current_error_handler(this, forward_error_with_try: bool = true) -> String {
         if .inside_defer or (
             .current_function.has_value() and
             .current_function!.return_type_id == never_type_id() and
@@ -223,7 +236,16 @@ struct CodeGenerator {
             return "MUST"
         }
 
-        return "TRY"
+        if forward_error_with_try {
+            if .control_flow_state.indirectly_inside_try_block {
+                // We can't use TRY() as that would return errors instead of forwarding them to the corresponding catch block.
+                return "TRY_EXPLICIT"
+            } else {
+                return "TRY"
+            }
+        } else {
+            return ""
+        }
     }
 
     fn fresh_var(mut this) -> String => format("__jakt_var_{}", .fresh_var_counter++)
@@ -320,14 +342,14 @@ struct CodeGenerator {
                     for action in scope.before_extern_include {
                         match action {
                             Define(name, value) => {
-                                before.append(format("#ifdef {}\n", name))
-                                before.append(format("#undef {}\n", name))
+                                before.appendff("#ifdef {}\n", name)
+                                before.appendff("#undef {}\n", name)
                                 before.append("#endif\n")
-                                before.append(format("#define {} {}\n", name, value))
+                                before.appendff("#define {} {}\n", name, value)
                             }
                             Undefine(name) => {
-                                before.append(format("#ifdef {}\n", name))
-                                before.append(format("#undef {}\n", name))
+                                before.appendff("#ifdef {}\n", name)
+                                before.appendff("#undef {}\n", name)
                                 before.append("#endif\n")
                             }
                         }
@@ -336,14 +358,14 @@ struct CodeGenerator {
                     for action in scope.after_extern_include {
                         match action {
                             Define(name, value) => {
-                                after.append(format("#ifdef {}\n", name))
-                                after.append(format("#undef {}\n", name))
+                                after.appendff("#ifdef {}\n", name)
+                                after.appendff("#undef {}\n", name)
                                 after.append("#endif\n")
-                                after.append(format("#define {} {}\n", name, value))
+                                after.appendff("#define {} {}\n", name, value)
                             }
                             Undefine(name) => {
-                                after.append(format("#ifdef {}\n", name))
-                                after.append(format("#undef {}\n", name))
+                                after.appendff("#ifdef {}\n", name)
+                                after.appendff("#undef {}\n", name)
                                 after.append("#endif\n")
                             }
                         }
@@ -356,7 +378,7 @@ struct CodeGenerator {
 
         for (path, actions) in imported_paths {
             output.append(actions.0)
-            output.append(format("#include <{}>\n", path))
+            output.appendff("#include <{}>\n", path)
             output.append(actions.1)
         }
 
@@ -370,7 +392,11 @@ struct CodeGenerator {
             }
             let module = generator.program.modules[i]
             generator.compiler.dbg_println(format("generate: module idx: {}, module.name {}", i, module.name))
-            let scope_id = ScopeId(module_id: module.id, id: 0)
+            let main_id = match module.id.id {
+                1 => 1uz
+                else => 0uz
+            }
+            let scope_id = ScopeId(module_id: module.id, id: main_id)
             let scope = generator.program.get_scope(scope_id)
             generator.codegen_namespace_predecl(scope, current_module: module, &mut output)
         }
@@ -402,7 +428,11 @@ struct CodeGenerator {
             output.append("#pragma once\n")
             output.append("#include \"__unified_forward.h\"\n")
 
-            let scope_id = ScopeId(module_id: module.id, id: 0)
+            let main_id = match module.id.id {
+                1 => 1uz
+                else => 0uz
+            }
+            let scope_id = ScopeId(module_id: module.id, id: main_id)
             let scope = generator.program.get_scope(scope_id)
 
             for child_scope_id in scope.children {
@@ -410,35 +440,35 @@ struct CodeGenerator {
                 if scope.import_path_if_extern.has_value() {
                     let has_name = scope.namespace_name.has_value()
                     if has_name {
-                        output.append(format("namespace {} {{\n", scope.namespace_name!))
+                        output.appendff("namespace {} {{\n", scope.namespace_name!)
                     }
                     for action in scope.before_extern_include {
                         match action {
                             Define(name, value) => {
-                                output.append(format("#ifdef {}\n", name))
-                                output.append(format("#undef {}\n", name))
+                                output.appendff("#ifdef {}\n", name)
+                                output.appendff("#undef {}\n", name)
                                 output.append("#endif\n")
-                                output.append(format("#define {} {}\n", name, value))
+                                output.appendff("#define {} {}\n", name, value)
                             }
                             Undefine(name) => {
-                                output.append(format("#ifdef {}\n", name))
-                                output.append(format("#undef {}\n", name))
+                                output.appendff("#ifdef {}\n", name)
+                                output.appendff("#undef {}\n", name)
                                 output.append("#endif\n")
                             }
                         }
                     }
-                    output.append(format("#include <{}>\n", scope.import_path_if_extern!))
+                    output.appendff("#include <{}>\n", scope.import_path_if_extern!)
                     for action in scope.after_extern_include {
                         match action {
                             Define(name, value) => {
-                                output.append(format("#ifdef {}\n", name))
-                                output.append(format("#undef {}\n", name))
+                                output.appendff("#ifdef {}\n", name)
+                                output.appendff("#undef {}\n", name)
                                 output.append("#endif\n")
-                                output.append(format("#define {} {}\n", name, value))
+                                output.appendff("#define {} {}\n", name, value)
                             }
                             Undefine(name) => {
-                                output.append(format("#ifdef {}\n", name))
-                                output.append(format("#undef {}\n", name))
+                                output.appendff("#ifdef {}\n", name)
+                                output.appendff("#undef {}\n", name)
                                 output.append("#endif\n")
                             }
                         }
@@ -474,7 +504,7 @@ struct CodeGenerator {
                     continue
                 }
                 let module = generator.program.modules[id.id]
-                output.append(format("#include \"{}.h\"\n", module.name))
+                output.appendff("#include \"{}.h\"\n", module.name)
             }
 
 
@@ -499,9 +529,13 @@ struct CodeGenerator {
             let impl_name = format("{}.cpp", module.name)
 
             output.clear()
-            output.append(format("#include \"{}\"\n", header_name))
+            output.appendff("#include \"{}\"\n", header_name)
 
-            let scope_id = ScopeId(module_id: module.id, id: 0)
+            let main_id = match module.id.id {
+                1 => 1uz
+                else => 0uz
+            }
+            let scope_id = ScopeId(module_id: module.id, id: main_id)
             let scope = generator.program.get_scope(scope_id)
 
 
@@ -545,7 +579,11 @@ struct CodeGenerator {
             let header_name = format("{}.h", module.name)
             let impl_name = format("{}_specializations.cpp", module.name)
 
-            let scope_id = ScopeId(module_id: module.id, id: 0)
+            let main_id = match module.id.id {
+                1 => 1uz
+                else => 0uz
+            }
+            let scope_id = ScopeId(module_id: module.id, id: main_id)
             let scope = generator.program.get_scope(scope_id)
 
             // We want to know which headers we want to include before we
@@ -570,7 +608,7 @@ struct CodeGenerator {
             if not code_output.is_empty() {
                 output = StringBuilder::create()
                 if i != 0 {
-                    output.append(format("#include \"{}\"\n", header_name))
+                    output.appendff("#include \"{}\"\n", header_name)
                 }
 
                 for id in ordered_imports {
@@ -578,7 +616,7 @@ struct CodeGenerator {
                         continue
                     }
                     let module = generator.program.modules[id.id]
-                    output.append(format("#include \"{}.h\"\n", module.name))
+                    output.appendff("#include \"{}.h\"\n", module.name)
                 }
                 output.append("namespace Jakt {\n")
                 output.append(code_output.to_string())
@@ -845,7 +883,7 @@ struct CodeGenerator {
                     } else {
                         output.append(", ")
                     }
-                    output.append(format("typename {}", name))
+                    output.appendff("typename {}", name)
                 }
             }
 
@@ -864,12 +902,12 @@ struct CodeGenerator {
                 args.push(.codegen_type(arg))
             }
 
-            output.append(format(
+            output.appendff(
                 "\n/* specialisation {} of function {}: {} */"
                 function.specialization_index!
                 function.name
                 args
-            ))
+            )
             output.append("\ntemplate<> ")
             if function.return_type_id == never_type_id() {
                 output.append("[[noreturn]] ")
@@ -931,11 +969,11 @@ struct CodeGenerator {
             }
             output.append(";\n")
         } else {
-            output.append(format("\n/* specialisation {} of function {} omitted, not fully specialized: {} */\n"
+            output.appendff("\n/* specialisation {} of function {} omitted, not fully specialized: {} */\n"
                 function.specialization_index!
                 function.name
                 function.generics.specializations[function.specialization_index!]
-            ))
+            )
         }
     }
 
@@ -1021,7 +1059,7 @@ struct CodeGenerator {
 
             let inside_namespace = output.to_string()
             output.clear()
-            output.append(format("namespace {} {{\n", scope.namespace_name!))
+            output.appendff("namespace {} {{\n", scope.namespace_name!)
             output.append(inside_namespace)
             output.append("}\n")
         }
@@ -1036,9 +1074,8 @@ struct CodeGenerator {
         if scope.alias_path.has_value() or scope.import_path_if_extern.has_value() {
             return
         }
-        if scope.namespace_name.has_value() {
-            output.append("namespace " + scope.namespace_name! + " {\n")
-        }
+
+        mut inside_namespace = StringBuilder::create()
 
         mut seen_types: {TypeId} = {}
 
@@ -1060,14 +1097,14 @@ struct CodeGenerator {
                             continue
                         }
                         let enum_ = .program.get_enum(enum_id)
-                        .codegen_enum(enum_, &mut output)
+                        .codegen_enum(enum_, output: &mut inside_namespace)
                     }
                     Struct(struct_id) => {
                         if not struct_id.module.equals(current_module.id) {
                             // Skip over imports from other modules
                             continue
                         }
-                        .codegen_struct(struct_: .program.get_struct(struct_id), &mut output)
+                        .codegen_struct(struct_: .program.get_struct(struct_id), output: &mut inside_namespace)
                     }
                     Trait => { }
                     else => {
@@ -1086,7 +1123,7 @@ struct CodeGenerator {
             if seen_types.contains(struct_.type_id) {
                 continue
             }
-            .codegen_struct(struct_, &mut output)
+            .codegen_struct(struct_, output: &mut inside_namespace)
             output.append("\n")
         }
 
@@ -1098,7 +1135,7 @@ struct CodeGenerator {
             if seen_types.contains(enum_.type_id) {
                 continue
             }
-            .codegen_enum(enum_, &mut output)
+            .codegen_enum(enum_, output: &mut inside_namespace)
             output.append("\n")
         }
 
@@ -1130,7 +1167,7 @@ struct CodeGenerator {
                 }
 
                 if not function.specialization_index.has_value() {
-                    .codegen_function_predecl(function, allow_generics: true, &mut output)
+                    .codegen_function_predecl(function, allow_generics: true, output: &mut inside_namespace)
                 }
             }
         }
@@ -1140,14 +1177,20 @@ struct CodeGenerator {
             if child_scope.namespace_name.has_value() {
                 let name = child_scope.namespace_name!
                 .namespace_stack.push(name)
-                .codegen_namespace_forward(scope: child_scope, current_module, &mut output)
+                .codegen_namespace_forward(scope: child_scope, current_module, output: &mut inside_namespace)
                 // FIXME: It's awkward that we need a temporary to avoid the C++ nodiscard warning
                 let dummy = .namespace_stack.pop()
             }
         }
 
-        if scope.namespace_name.has_value() {
-            output.append("}\n")
+        if inside_namespace.length() != 0 {
+            if scope.namespace_name.has_value() {
+                output.append("namespace " + scope.namespace_name! + " {\n")
+            }
+            output.append(inside_namespace.to_string())
+            if scope.namespace_name.has_value() {
+                output.append("}\n")
+            }
         }
     }
 
@@ -1264,11 +1307,11 @@ struct CodeGenerator {
                     output: &mut inside_namespace
                 )
 
-                inside_namespace.append(format("{0}::~{0}()", enum_.name))
+                inside_namespace.appendff("{0}::~{0}()", enum_.name)
 
                 .codegen_enum_destructor_body(enum_, output: &mut inside_namespace)
 
-                inside_namespace.append(format("void {0}::__jakt_destroy_variant() {{\n", enum_.name))
+                inside_namespace.appendff("void {0}::__jakt_destroy_variant() {{\n", enum_.name)
                 .codegen_enum_destroy_variant(enum_, output: &mut inside_namespace)
                 inside_namespace.append("}\n")
             }
@@ -1307,7 +1350,7 @@ struct CodeGenerator {
 
         if not inside_namespace.is_empty() {
             if scope.namespace_name.has_value() {
-                output.append(format("namespace {} {{\n", scope.namespace_name!))
+                output.appendff("namespace {} {{\n", scope.namespace_name!)
                 output.append(inside_namespace.to_string())
                 output.append("}\n")
             } else {
@@ -1487,7 +1530,7 @@ struct CodeGenerator {
             return
         }
 
-        if function.linkage is External {
+        if function.linkage is External and not as_method {
             output.append("extern ")
         }
 
@@ -1508,12 +1551,14 @@ struct CodeGenerator {
                 output.append("virtual ")
             }
 
-            let naked_return_type = .codegen_type(function.return_type_id)
-            let return_type = match function.can_throw {
-                true => format("ErrorOr<{}>", naked_return_type)
-                false => naked_return_type
+            if not function.type is Destructor and not function.type is Constructor {
+                let naked_return_type = .codegen_type(function.return_type_id)
+                let return_type = match function.can_throw {
+                    true => format("ErrorOr<{}>", naked_return_type)
+                    false => naked_return_type
+                }
+                output.append(return_type)
             }
-            output.append(return_type)
         }
 
         output.append(" ")
@@ -1597,7 +1642,7 @@ struct CodeGenerator {
                 output: &mut template_parameters_builder
             )
             template_parameters = template_parameters_builder.to_string()
-            output.append(format("template <{}>", template_parameters))
+            output.appendff("template <{}>", template_parameters)
         }
 
         match struct_.record_type {
@@ -1618,22 +1663,22 @@ struct CodeGenerator {
                     class_name_with_generics += ">"
                 }
 
-                output.append(format("class {} :", struct_.name_for_codegen().as_name_for_definition()))
+                output.appendff("class {} :", struct_.name_for_codegen().as_name_for_definition())
                 if struct_.super_struct_id.has_value() {
-                    output.append(format("public {}", .codegen_struct_type(id: struct_.super_struct_id!, as_namespace: true)))
+                    output.appendff("public {}", .codegen_struct_type(id: struct_.super_struct_id!, as_namespace: true))
                     if not (.program.get_struct(struct_.super_struct_id!).record_type is Class) {
-                        output.append(format(
+                        output.appendff(
                             ", public RefCounted<{}>, public Weakable<{}>"
                             class_name_with_generics
                             class_name_with_generics
-                        ))
+                        )
                     }
                 } else {
-                    output.append(format(
+                    output.appendff(
                         "public RefCounted<{}>, public Weakable<{}> "
                         class_name_with_generics
                         class_name_with_generics
-                    ))
+                    )
                 }
 
                 output.append("{\n")
@@ -1650,13 +1695,13 @@ struct CodeGenerator {
                 }
                 if not has_destructor {
                     output.append("  public:\n")
-                    output.append(format("virtual ~{}() = default;\n", struct_.name_for_codegen().as_name_for_definition()))
+                    output.appendff("virtual ~{}() = default;\n", struct_.name_for_codegen().as_name_for_definition())
                 }
             }
             Struct => {
-                output.append(format("struct {}", struct_.name_for_codegen().as_name_for_definition()))
+                output.appendff("struct {}", struct_.name_for_codegen().as_name_for_definition())
                 if struct_.super_struct_id.has_value() {
-                    output.append(format(": public {}", .codegen_struct_type(id: struct_.super_struct_id!, as_namespace: true)))
+                    output.appendff(": public {}", .codegen_struct_type(id: struct_.super_struct_id!, as_namespace: true))
                 }
                 output.append(" {\n")
                 output.append("  public:\n")
@@ -1748,7 +1793,7 @@ struct CodeGenerator {
     ) throws {
         if enum_.underlying_type_id != void_type_id() {
             if .program.is_integer(enum_.underlying_type_id) {
-                output.append(format("enum class {}: {};", enum_.name, .codegen_type(enum_.underlying_type_id)))
+                output.appendff("enum class {}: {};", enum_.name, .codegen_type(enum_.underlying_type_id))
                 return
             } else {
                 todo("Enums with a non-integer underlying type")
@@ -1762,13 +1807,13 @@ struct CodeGenerator {
             .codegen_template_parameter_names(enum_.generic_parameters, &mut output)
             output.append(">\n")
         }
-        output.append(format("struct {};\n", enum_.name))
+        output.appendff("struct {};\n", enum_.name)
     }
 
     fn codegen_enum(mut this, enum_: CheckedEnum, output: &mut StringBuilder) throws {
         if enum_.underlying_type_id != void_type_id() {
             if .program.is_integer(enum_.underlying_type_id) {
-                output.append(format("enum class {} : {} {{\n", enum_.name, .codegen_type(enum_.underlying_type_id)))
+                output.appendff("enum class {} : {} {{\n", enum_.name, .codegen_type(enum_.underlying_type_id))
                 for variant in enum_.variants {
                     guard variant is WithValue(name, expr) else {
                         todo(format("codegen_enum can't generate variant: {}", variant))
@@ -1798,11 +1843,11 @@ struct CodeGenerator {
             output.append(template_args)
             output.append(">\n")
         }
-        output.append(format("struct {}", enum_.name))
+        output.appendff("struct {}", enum_.name)
         if enum_.is_boxed {
-            output.append(format(": public RefCounted<{}", enum_.name))
+            output.appendff(": public RefCounted<{}", enum_.name)
             if is_generic {
-                output.append(format("<{}>", join(generic_parameter_names, separator: ", ")))
+                output.appendff("<{}>", join(generic_parameter_names, separator: ", "))
         }
             output.append(">")
         }
@@ -1839,7 +1884,7 @@ struct CodeGenerator {
         // We'll use a getter for the variant index, so that the outputted C++ doesn't
         // have implicit "off-by-one" calculations.
 
-        output.append(format("{} __jakt_variant_index = 0;\n", index_type, max_index_value))
+        output.appendff("{} __jakt_variant_index = 0;\n", index_type, max_index_value)
 
         if not common_fields.is_empty() {
             // Another maybe-uninitialized data member for the common fields.
@@ -1855,7 +1900,7 @@ struct CodeGenerator {
 
             // Make common fields available
             for (field_name, type) in common_fields {
-                output.append(format("{} {};\n", type, field_name))
+                output.appendff("{} {};\n", type, field_name)
             }
 
             output.append("} init_common;\n")
@@ -1881,9 +1926,9 @@ struct CodeGenerator {
             if not fields.is_empty() {
                 output.append("struct {\n")
                 for (field_name, field_type) in fields.iterator() {
-                    output.append(format("{} {};\n", field_type, field_name))
+                    output.appendff("{} {};\n", field_type, field_name)
                 }
-                output.append(format("}} {};\n", variant.name()))
+                output.appendff("}} {};\n", variant.name())
             }
         }
 
@@ -1894,7 +1939,7 @@ struct CodeGenerator {
         output.append("~VariantData() {}\n")
 
         output.append("} as;\n")
-        output.append(format("constexpr {} __jakt_init_index() const noexcept {{ return __jakt_variant_index - 1; }}", index_type))
+        output.appendff("constexpr {} __jakt_init_index() const noexcept {{ return __jakt_variant_index - 1; }}", index_type)
 
 
         if enum_.generic_parameters.is_empty() {
@@ -1917,7 +1962,7 @@ struct CodeGenerator {
                 &mut output
             )
 
-            output.append(format("~{}()", enum_.name))
+            output.appendff("~{}()", enum_.name)
 
             .codegen_enum_destructor_body(enum_, &mut output)
 
@@ -1945,11 +1990,11 @@ struct CodeGenerator {
 
             // Forward declare destructor, move assignment and copy assignment
             // operators/constructors.
-            output.append(format("~{}();\n", enum_.name))
-            output.append(format("{0}& operator=({0} const &);\n", enum_.name))
-            output.append(format("{0}& operator=({0} &&);\n", enum_.name))
-            output.append(format("{0}({0} const&);\n", enum_.name))
-            output.append(format("{0}({0} &&);\n", enum_.name))
+            output.appendff("~{}();\n", enum_.name)
+            output.appendff("{0}& operator=({0} const &);\n", enum_.name)
+            output.appendff("{0}& operator=({0} &&);\n", enum_.name)
+            output.appendff("{0}({0} const&);\n", enum_.name)
+            output.appendff("{0}({0} &&);\n", enum_.name)
             output.append("private: void __jakt_destroy_variant();\n")
             output.append("public:\n")
         }
@@ -1979,7 +2024,7 @@ struct CodeGenerator {
         // The only private thing is the default constructor, which is
         // overriden to allow the `static` functions to start with an undefined
         // value and write to it.
-        output.append(format("private:\n{}() {{}};\n", enum_.name))
+        output.appendff("private:\n{}() {{}};\n", enum_.name)
 
         output.append("};\n")
 
@@ -1997,9 +2042,9 @@ struct CodeGenerator {
     ) {
         output.append("[[nodiscard]] ")
         if is_inline {
-            output.append(format("static {} {}(", ctor_result_type, variant_name))
+            output.appendff("static {} {}(", ctor_result_type, variant_name)
         } else {
-            output.append(format("{} {}::{}(", ctor_result_type, enum_name, variant_name))
+            output.appendff("{} {}::{}(", ctor_result_type, enum_name, variant_name)
         }
 
         let has_common_fields = not common_fields.is_empty()
@@ -2007,23 +2052,23 @@ struct CodeGenerator {
         // arguments
         if has_common_fields {
             let (first_name, first_type) = common_fields[0]
-            output.append(format("{} {}", first_type, first_name))
+            output.appendff("{} {}", first_type, first_name)
 
             for i in 1..common_fields.size() {
                 let (name, type) = common_fields[i]
-                output.append(format(", {} {}", type, name))
+                output.appendff(", {} {}", type, name)
             }
 
             for (name, type) in variant_fields {
-                output.append(format(", {} {}", type, name))
+                output.appendff(", {} {}", type, name)
             }
         } else if not variant_fields.is_empty() {
             let (first_name, first_type) = variant_fields[0]
-            output.append(format("{} {}", first_type, first_name))
+            output.appendff("{} {}", first_type, first_name)
 
             for i in 1..variant_fields.size() {
                 let (name, type) = variant_fields[i]
-                output.append(format(", {} {}", type, name))
+                output.appendff(", {} {}", type, name)
             }
         }
 
@@ -2033,14 +2078,14 @@ struct CodeGenerator {
     fn codegen_for_enum_variants(this, anon enum_: &CheckedEnum, anon stmt_fmt: &fn(accessor: String) -> String, index_expr: String, builder: &mut StringBuilder) {
         // Adding to output here in a loop was causing a 30% slowdown, so using
         // a StringBuilder to mitigate it.
-        builder.append(format("switch ({}) {{\n", index_expr))
+        builder.appendff("switch ({}) {{\n", index_expr)
 
         let common_field_count = enum_.fields.size()
 
         for variant_index in 0..enum_.variants.size() {
             let variant = &enum_.variants[variant_index]
             let variant_name = variant.name()
-            builder.append(format("case {} /* {} */:\n", variant_index, variant_name))
+            builder.appendff("case {} /* {} */:\n", variant_index, variant_name)
 
             match variant {
                 Untyped | WithValue => {}
@@ -2210,7 +2255,7 @@ struct CodeGenerator {
             output .append(declare_uninit)
 
             // +1 because 0 is the uninitialized tag
-            output .append(format("{}__jakt_variant_index = {};\n", deref_uninit, variant_index + 1))
+            output .appendff("{}__jakt_variant_index = {};\n", deref_uninit, variant_index + 1)
 
             for field in common_fields {
                 let name = field.0
@@ -2235,9 +2280,9 @@ struct CodeGenerator {
 
         // Copy assignment operator
         if is_inside_struct {
-            output.append(format("{0}& operator=({0} const &rhs)", enum_.name))
+            output.appendff("{0}& operator=({0} const &rhs)", enum_.name)
         } else {
-            output.append(format("{0}& {0}::operator=({0} const &rhs)", enum_.name))
+            output.appendff("{0}& {0}::operator=({0} const &rhs)", enum_.name)
         }
         output.append("{\n")
         output.append(.codegen_enum_assignment_body(enum_,is_constructor: false use_move: false))
@@ -2246,17 +2291,17 @@ struct CodeGenerator {
 
         // Copy constructor
         if is_inside_struct {
-            output.append(format("{0}({0} const &rhs)", enum_.name))
+            output.appendff("{0}({0} const &rhs)", enum_.name)
         } else {
-            output.append(format("{0}::{0}({0} const &rhs)", enum_.name))
+            output.appendff("{0}::{0}({0} const &rhs)", enum_.name)
         }
         output.append(.codegen_enum_assignment_body(enum_, is_constructor: true, use_move: false))
 
         // Move assignment operator
         if is_inside_struct {
-            output.append(format("{0}& operator=({0} &&rhs)", enum_.name))
+            output.appendff("{0}& operator=({0} &&rhs)", enum_.name)
         } else {
-            output.append(format("{0}& {0}::operator=({0} &&rhs)", enum_.name))
+            output.appendff("{0}& {0}::operator=({0} &&rhs)", enum_.name)
         }
         output.append("{\n")
         output.append(.codegen_enum_assignment_body(enum_, is_constructor: false, use_move: true))
@@ -2265,9 +2310,9 @@ struct CodeGenerator {
 
         // Move constructor
         if is_inside_struct {
-            output.append(format("{0}({0} &&rhs)", enum_.name))
+            output.appendff("{0}({0} &&rhs)", enum_.name)
         } else {
-            output.append(format("{0}::{0}({0} &&rhs)", enum_.name))
+            output.appendff("{0}::{0}({0} &&rhs)", enum_.name)
         }
         output.append("{\n")
         output.append(.codegen_enum_assignment_body(enum_, is_constructor: true, use_move: true))
@@ -2362,14 +2407,14 @@ struct CodeGenerator {
         for variant_index in 0..enum_.variants.size() {
             let variant = enum_.variants[variant_index]
             let variant_name = variant.name()
-            output.append(format("case {} /* {} */:", variant_index, variant_name))
+            output.appendff("case {} /* {} */:", variant_index, variant_name)
 
             match variant {
                 Untyped | WithValue => {}
                 Typed(type_id) => {
                     let ds_name = .destructor_name(type_id)
                     if ds_name is Some(name) {
-                        output.append(format("this->as.{}.value.~{}();\n", variant_name, name))
+                        output.appendff("this->as.{}.value.~{}();\n", variant_name, name)
                     }
                 }
                 StructLike(fields) => {
@@ -2379,11 +2424,11 @@ struct CodeGenerator {
                         let ds: String? = .destructor_name(variable.type_id)
 
                         if ds is Some(name) {
-                            output.append(format("this->as.{}.{}.~{}();\n",
+                            output.appendff("this->as.{}.{}.~{}();\n",
                                 variant_name
                                 variable.name_for_codegen().as_name_for_use()
                                 name
-                            ))
+                            )
                         }
                     }
                 }
@@ -2407,7 +2452,7 @@ struct CodeGenerator {
             let variable = .program.get_variable(common_field.variable_id)
             let ds: String? = .destructor_name(variable.type_id)
             if ds is Some(name) {
-                output.append(format("this->common.init_common.{}.~{}();\n", variable.name_for_codegen().as_name_for_use(), name))
+                output.appendff("this->common.init_common.{}.~{}();\n", variable.name_for_codegen().as_name_for_use(), name)
             }
         }
 
@@ -2433,7 +2478,7 @@ struct CodeGenerator {
         }
         output.append("debug_description() const { ")
         output.append("auto builder = ByteStringBuilder::create();")
-        output.append(format("builder.append(\"{}(\"sv);", struct_.name_for_codegen().as_name_for_use()))
+        output.appendff("builder.append(\"{}(\"sv);", struct_.name_for_codegen().as_name_for_use())
         output.append("{\n")
         output.append("JaktInternal::PrettyPrint::ScopedLevelIncrease increase_indent {};\n")
 
@@ -2441,7 +2486,7 @@ struct CodeGenerator {
         for field in struct_.fields {
             let field_var = .program.get_variable(field.variable_id)
             output.append("JaktInternal::PrettyPrint::must_output_indentation(builder);\n")
-            output.append(format("builder.appendff(\"{}: ", field_var.name_for_codegen().as_name_for_use()))
+            output.appendff("builder.appendff(\"{}: ", field_var.name_for_codegen().as_name_for_use())
             if .program.is_string(field_var.type_id) {
                 output.append("\\\"{}\\\"")
             } else {
@@ -2496,11 +2541,11 @@ struct CodeGenerator {
         for i in 0..enum_.variants.size() {
             let variant = enum_.variants[i]
             let name = variant.name()
-            output.append(format("case {} /* {} */: {{\n", i, name))
+            output.appendff("case {} /* {} */: {{\n", i, name)
             match variant {
                 StructLike(fields) => {
-                    output.append(format("builder.append(\"{}::{}\"sv);\n", enum_.name, name))
-                    output.append(format("[[maybe_unused]] auto const& that = this->as.{};\n", name))
+                    output.appendff("builder.append(\"{}::{}\"sv);\n", enum_.name, name)
+                    output.appendff("[[maybe_unused]] auto const& that = this->as.{};\n", name)
                     output.append("builder.append(\"(\"sv);\n")
                     output.append("{\n");
                     output.append("JaktInternal::PrettyPrint::ScopedLevelIncrease increase_indent {};\n")
@@ -2509,17 +2554,17 @@ struct CodeGenerator {
                         output.append("JaktInternal::PrettyPrint::must_output_indentation(builder);\n")
                         let var = .program.get_variable(field)
                         if .program.is_string(var.type_id){
-                            output.append(format("builder.appendff(\"{}: \\\"{{}}\\\"", var.name_for_codegen().as_name_for_use()))
+                            output.appendff("builder.appendff(\"{}: \\\"{{}}\\\"", var.name_for_codegen().as_name_for_use())
                         } else {
-                            output.append(format("builder.appendff(\"{}: {{}}", var.name_for_codegen().as_name_for_use()))
+                            output.appendff("builder.appendff(\"{}: {{}}", var.name_for_codegen().as_name_for_use())
                         }
                         if i != fields.size() - 1 {
                             output.append(", ")
                         }
                         if i < common_field_count {
-                            output.append(format("\", this->common.init_common.{});\n", var.name_for_codegen().as_name_for_use()))
+                            output.appendff("\", this->common.init_common.{});\n", var.name_for_codegen().as_name_for_use())
                         } else {
-                            output.append(format("\", that.{});\n", var.name_for_codegen().as_name_for_use()))
+                            output.appendff("\", that.{});\n", var.name_for_codegen().as_name_for_use())
                         }
                         i++
                     }
@@ -2527,8 +2572,8 @@ struct CodeGenerator {
                     output.append("builder.append(\")\"sv);\n")
                 }
                 Typed(type_id) => {
-                    output.append(format("builder.append(\"{}::{}\"sv);\n", enum_.name, name))
-                    output.append(format("[[maybe_unused]] auto const& that = this->as.{};\n", name))
+                    output.appendff("builder.append(\"{}::{}\"sv);\n", enum_.name, name)
+                    output.appendff("[[maybe_unused]] auto const& that = this->as.{};\n", name)
                     if .program.is_string(type_id){
                         output.append("builder.appendff(\"(\\\"{}\\\")\", that.value);\n")
                     } else {
@@ -2536,7 +2581,7 @@ struct CodeGenerator {
                     }
                 }
                 else => {
-                    output.append(format("return ByteString(\"{}::{}\"sv);\n", enum_.name, name))
+                    output.appendff("return ByteString(\"{}::{}\"sv);\n", enum_.name, name)
                 }
             }
 
@@ -2567,10 +2612,10 @@ struct CodeGenerator {
         }
 
         output.append("} // namespace Jakt\n")
-        output.append(format("template<{}>", template_args))
-        output.append(format("struct Jakt::Formatter<Jakt::{}> : Jakt::Formatter<Jakt::StringView>", qualified_name))
+        output.appendff("template<{}>", template_args)
+        output.appendff("struct Jakt::Formatter<Jakt::{}> : Jakt::Formatter<Jakt::StringView>", qualified_name)
         output.append("{\n")
-        output.append(format("Jakt::ErrorOr<void> format(Jakt::FormatBuilder& builder, Jakt::{} const& value) {{\n", qualified_name))
+        output.appendff("Jakt::ErrorOr<void> format(Jakt::FormatBuilder& builder, Jakt::{} const& value) {{\n", qualified_name)
         output.append("JaktInternal::PrettyPrint::ScopedEnable pretty_print_enable { m_alternative_form };")
         output.append("Jakt::ErrorOr<void> format_error = Jakt::Formatter<Jakt::StringView>::format(builder, value.debug_description());")
         output.append("return format_error;")
@@ -2593,10 +2638,12 @@ struct CodeGenerator {
         .codegen_expression(expression, &mut output)
     }
 
+    // `forward_error_with_try` controls whether errors are handled through the TRY() macro or through an external mechanism put by the caller.
     fn codegen_expression(
         mut this
         anon expression: CheckedExpression
         output: &mut StringBuilder
+        forward_error_with_try: bool = true
     ) throws {
         .generic_inferences = expression.generic_inferences ?? .generic_inferences
         defer .generic_inferences = None
@@ -2666,14 +2713,14 @@ struct CodeGenerator {
                     }
 
                     let name = .program.get_function(ids![0]).name_for_codegen().as_name_for_use()
-                    let error_handler = match val.may_throw { true => .current_error_handler(), else => "" }
-                    output.append(format(
+                    let error_handler = match val.may_throw { true => .current_error_handler(forward_error_with_try), else => "" }
+                    output.appendff(
                         "{}({}::{}(\"{}\"sv))"
                         error_handler
                         .codegen_type(val.type_id)
                         name
                         escaped_value
-                    ))
+                    )
                 }
             }
             ByteConstant(val) => {
@@ -2716,9 +2763,9 @@ struct CodeGenerator {
                 output.append("((")
                 .codegen_expression(expr, &mut output)
                 if is_optional {
-                    output.append(format(").map([](auto& _value) {{ return _value.template get<{}>(); }}))", index))
+                    output.appendff(").map([](auto& _value) {{ return _value.template get<{}>(); }}))", index)
                 } else {
-                    output.append(format(").template get<{}>())", index))
+                    output.appendff(").template get<{}>())", index)
                 }
             }
             IndexedStruct(expr, name, index, is_optional) => {
@@ -2812,10 +2859,10 @@ struct CodeGenerator {
                 .codegen_block(block, &mut output)
             }
             Call(call) => {
-                .codegen_call(call, &mut output)
+                .codegen_call(call, &mut output, forward_error_with_try)
             }
             MethodCall(expr, call, is_optional) => {
-                .codegen_method_call(expr, call, is_optional, &mut output)
+                .codegen_method_call(expr, call, is_optional, &mut output, forward_error_with_try)
             }
             Boolean(val) => {
                 output.append(match val {
@@ -2950,10 +2997,10 @@ struct CodeGenerator {
                                     }
                                     variant_index++
                                 }
-                                output.append(format("__jakt_init_index() == {} /* {} */", variant_index, name))
+                                output.appendff("__jakt_init_index() == {} /* {} */", variant_index, name)
                             }
                             ValueEnum => {
-                                output.append(format("== {}{}::{}", .codegen_namespace_qualifier(scope_id: enum_.scope_id), enum_.name, name))
+                                output.appendff("== {}{}::{}", .codegen_namespace_qualifier(scope_id: enum_.scope_id), enum_.name, name)
                             }
                             else => {
                                 panic(format("Unexpected enum record type in IsEnumVariant: {}", enum_.record_type))
@@ -2973,7 +3020,7 @@ struct CodeGenerator {
                 output.append(")")
             }
             BinaryOp(lhs, rhs, op, type_id) => {
-                .codegen_binary_expression(expression, type_id, lhs, rhs, op, &mut output)
+                .codegen_binary_expression(expression, type_id, lhs, rhs, op, &mut output, forward_error_with_try)
             }
             NumericConstant(val, type_id) => {
                 let suffix = match val {
@@ -3023,10 +3070,6 @@ struct CodeGenerator {
             }
             EnumVariantArg(expr, arg, enum_variant) => {
                 let variant_name = enum_variant.name()
-                mut arg_name = "value"
-                if enum_variant is StructLike {
-                    arg_name = arg.name ?? arg.binding
-                }
 
                 let enum_ = .program.get_enum(enum_variant.enum_id())
 
@@ -3037,11 +3080,20 @@ struct CodeGenerator {
 
                 // use the common section if the binding uses a common field
                 mut section = format("as.{}", variant_name)
+
+                mut is_common_field = false
+                mut field_name = arg.name ?? arg.binding
                 for field in enum_.fields {
-                    let field_name = .program.get_variable(field.variable_id).name_for_codegen().as_name_for_use()
-                    if field_name == arg_name {
+                    let var_name = .program.get_variable(field.variable_id).name_for_codegen().as_name_for_use()
+                    if var_name == field_name {
                         section = "common.init_common"
+                        is_common_field = true
+                        break
                     }
+                }
+
+                if not is_common_field and not enum_variant is StructLike {
+                    field_name = "value"
                 }
 
                 output.append("(")
@@ -3050,7 +3102,7 @@ struct CodeGenerator {
                 output.append(cpp_deref_operator)
                 output.append(section)
                 output.append(".")
-                output.append(arg_name)
+                output.append(field_name)
             }
             JaktArray(vals, repeat, span, type_id, inner_type_id) => {
                 if repeat.has_value() {
@@ -3080,9 +3132,9 @@ struct CodeGenerator {
                 }
             }
             JaktDictionary(vals, span, type_id, key_type_id, value_type_id) => {
-                output.append(format("Dictionary<{}, {}>::create_with_entries({{",
+                output.appendff("Dictionary<{}, {}>::create_with_entries({{",
                     .codegen_type(key_type_id),
-                    .codegen_type(value_type_id)))
+                    .codegen_type(value_type_id))
 
                 mut first = true
                 for (key, value) in vals {
@@ -3102,7 +3154,7 @@ struct CodeGenerator {
                 output.append("})")
             }
             JaktSet(vals, span, type_id, inner_type_id) => {
-                output.append(format("Set<{}>::create_with_values({{", .codegen_type(inner_type_id)))
+                output.appendff("Set<{}>::create_with_values({{", .codegen_type(inner_type_id))
                 mut first = true
                 for value in vals {
                     if not first {
@@ -3153,11 +3205,11 @@ struct CodeGenerator {
                 .control_flow_state = last_control_flow.enter_function()
                 defer .control_flow_state = last_control_flow
 
-                output.append(format(
+                output.appendff(
                     "[{}]({}) -> {} "
                     join(generated_captures, separator: ", ")
                     join(generated_params, separator: ", ")
-                    return_type))
+                    return_type)
 
                 if pseudo_function_id.has_value() {
                     let function = .program.get_function(pseudo_function_id!)
@@ -3173,18 +3225,46 @@ struct CodeGenerator {
             }
             TryBlock(stmt, error_name, catch_block, span) => {
                 let try_var = .fresh_var()
+                let can_affect_loop = match stmt.control_flow() {
+                    MayReturn => false
+                    else => true
+                }
 
-                output.append("auto ")
-                output.append(try_var)
-                output.append(" = [&]() -> ErrorOr<void> {")
+                mut builder = StringBuilder::create()
                 let last_control_flow = .control_flow_state
-                .control_flow_state.directly_inside_match = false
-                .control_flow_state.indirectly_inside_match = false
+                if can_affect_loop {
+                    .control_flow_state.indirectly_inside_try_block = true
+                    builder.append(format("[&]() -> JaktInternal::ExplicitValueOrControlFlow<ErrorOr<void>, {}> {{\n", .codegen_function_return_type(function: .current_function!)))
+                } else {
+                    builder.append("auto ")
+                    builder.append(try_var)
+                    builder.append(" = [&]() -> ErrorOr<void> {\n")
+                    .control_flow_state.directly_inside_match = false
+                    .control_flow_state.indirectly_inside_match = false
+                }
                 .control_flow_state.passes_through_try = true
-                .codegen_statement(statement: stmt, &mut output)
-                output.append(";")
-                output.append("return {};")
-                output.append("}();\n")
+                .codegen_statement(statement: stmt, output: &mut builder)
+                builder.append(";\n")
+                if can_affect_loop {
+                    builder.append("return JaktInternal::ExplicitValue<ErrorOr<void>>({});")
+                } else {
+                    builder.append("return ErrorOr<void> {};")
+                }
+                builder.append("}();\n")
+
+                if can_affect_loop {
+                    output.append("auto ")
+                    output.append(try_var)
+                    output.append(" = ")
+                    output.append(.control_flow_state.apply_control_flow_macro(
+                        builder.to_string()
+                        func_return_type: .current_function!.return_type_id
+                        func_can_throw: .current_function!.can_throw
+                    ))
+                    output.append(";\n")
+                } else {
+                    output.append(builder.to_string())
+                }
 
                 output.append("if (")
                 output.append(try_var)
@@ -3194,7 +3274,7 @@ struct CodeGenerator {
                     output.append(error_name)
                     output.append(" = ")
                     output.append(try_var)
-                    output.append(".release_error();")
+                    output.append(".release_error();\n")
                 }
                 .codegen_block(block: catch_block, &mut output)
                 .control_flow_state = last_control_flow
@@ -3226,13 +3306,20 @@ struct CodeGenerator {
                 output.append(" = [&]() -> ErrorOr<")
                 output.append(.codegen_type(inner_type_id))
                 output.append("> { return ")
-                .codegen_expression(expr, &mut output)
+                // Since it's a return statement, we don't have to wrap the expression with TRY.
+                // Unless it's a "void expression", where we must use TRY() in order to propagate its
+                // effect before returning an ErrorOr<void>{}
+                .codegen_expression(expr, &mut output, forward_error_with_try: is_void)
                 if is_void {
                     output.append(", ErrorOr<void>{}")
                 }
                 output.append("; }();\n")
 
                 if catch_block.has_value() {
+                    // At this point, we're no longer inside the try, so restore the control flow state (partially).
+                    .control_flow_state.indirectly_inside_match = last_control_flow.indirectly_inside_match
+                    .control_flow_state.directly_inside_match = last_control_flow.directly_inside_match
+
                     output.append("if (")
                     output.append(try_var)
                     output.append(".is_error()) {")
@@ -3244,12 +3331,16 @@ struct CodeGenerator {
                         output.append(".release_error();\n")
                     }
 
-                    .control_flow_state = last_control_flow
-                    if catch_block!.yielded_type.has_value() and not catch_block!.yielded_type!.equals(void_type_id()) {
-                        output.append(fresh_var)
-                        output.append(" = (")
+                    if catch_block!.yielded_type.has_value() {
+                        let label = .fresh_label()
+                        let old_yield_method = .yield_method
+                        .yield_method = YieldMethod::AssignAndGoto(name: fresh_var, label)
+                        defer .yield_method = old_yield_method
+
                         .codegen_block(block: catch_block!, &mut output)
-                        output.append(");\n")
+
+                        output.append(label)
+                        output.append(":;\n")
                     } else {
                         .codegen_block(block: catch_block!, &mut output)
                     }
@@ -3318,6 +3409,11 @@ struct CodeGenerator {
 
         let cpp_match_result_type = .codegen_type(type_id)
         let expr_type = .program.get_type(expr.type())
+
+        let old_yield_method = .yield_method
+        .yield_method = YieldMethod::ReturnExplicitValue(ctor: format("JaktInternal::ExplicitValue<{}>", cpp_match_result_type))
+        defer .yield_method = old_yield_method
+
         if expr_type is Enum(enum_id) {
             .codegen_enum_match(
                 enum_: .program.get_enum(enum_id)
@@ -3370,11 +3466,11 @@ struct CodeGenerator {
         )
 
         // TODO: Use switch statement if all values are constant
-        output.append(format(
+        output.appendff(
             "([&]() -> JaktInternal::ExplicitValueOrControlFlow<{},{}> {{\n"
             cpp_match_result_type,
             .codegen_function_return_type(function: .current_function!)
-        ))
+        )
 
         if is_generic_enum {
             output.append("auto&& __jakt_enum_value = JaktInternal::deref_if_ref_pointer(")
@@ -3407,7 +3503,7 @@ struct CodeGenerator {
                         variant_index++
                     }
 
-                    output.append(format("if (__jakt_enum_value.__jakt_init_index() == {} /* {} */) {{\n", variant_index, name))
+                    output.appendff("if (__jakt_enum_value.__jakt_init_index() == {} /* {} */) {{\n", variant_index, name)
 
                     mut variant_type_name = ""
                     let qualifier = .codegen_type_possibly_as_namespace(type_id: subject_type_id, as_namespace: true)
@@ -3426,8 +3522,25 @@ struct CodeGenerator {
                         for arg in args {
                             output.append("auto& ")
                             output.append(arg.binding)
-                            output.append(" = __jakt_match_value.")
-                            output.append(arg.name ?? "value")
+
+                            mut is_common_member = false
+                            if arg.name is Some(name) {
+                                for field in enum_.fields {
+                                    let var = .program.get_variable(field.variable_id)
+                                    if var.name == name {
+                                        is_common_member = true
+                                        break
+                                    }
+                                }
+                            }
+
+                            if is_common_member {
+                                output.append(" = __jakt_enum_value.common.init_common.")
+                                output.append(arg.name!)
+                            } else {
+                                output.append(" = __jakt_match_value.")
+                                output.append(arg.name ?? "value")
+                            }
                             output.append(";\n")
                         }
                     }
@@ -3498,12 +3611,12 @@ struct CodeGenerator {
                 }
                 ClassInstance(type, body, rebind_name, marker_span) => {
                     let type_name = .codegen_type_possibly_as_namespace(type_id: type, as_namespace: true)
-                    output.append(format("if (is<{}>(__jakt_enum_value.ptr())) {{\n", type_name))
-                    output.append(format(
+                    output.appendff("if (is<{}>(__jakt_enum_value.ptr())) {{\n", type_name)
+                    output.appendff(
                         "auto {} = NonnullRefPtr {{ *static_cast<RawPtr<{}>>(__jakt_enum_value.ptr()) }};\n"
                         (rebind_name?.name ?? "__jakt_match_value")
                         type_name
-                    ))
+                    )
 
                     for default_ in defaults {
                         .codegen_statement(statement: default_, &mut output)
@@ -3566,16 +3679,16 @@ struct CodeGenerator {
                         }
                         let match_case_enum = .program.get_enum(enum_id)
                         let variant = match_case_enum.variants[index]
-                        output.append(format("case {} /* {} */: ", index, variant.name()) + "{\n")
+                        output.appendff("case {} /* {} */: {{\n", index, variant.name())
                         match variant {
                             Untyped(name) => {
                             }
                             Typed(name, type_id) => {
                                 if not args.is_empty() {
-                                    output.append(format(
+                                    output.appendff(
                                         "auto&& __jakt_match_value = __jakt_match_variant.as.{};",
                                         name
-                                    ))
+                                    )
 
                                     let arg = args[0]
                                     let var = .program.find_var_in_scope(scope_id, var: arg.binding)!
@@ -3590,9 +3703,9 @@ struct CodeGenerator {
                             }
                             StructLike(name, fields) => {
                                 if not args.is_empty() {
-                                    output.append(format(
+                                    output.appendff(
                                         "auto&& __jakt_match_value = __jakt_match_variant.as.{};",
-                                        name))
+                                        name)
 
                                     for arg in args {
                                         let var = .program.find_var_in_scope(scope_id, var: arg.binding)!
@@ -3602,8 +3715,25 @@ struct CodeGenerator {
                                         }
                                         output.append("& ")
                                         output.append(arg.binding)
-                                        output.append(" = __jakt_match_value.")
-                                        output.append(arg.name.value_or(arg.binding))
+
+
+                                        let accessor = arg.name ?? arg.binding
+                                        mut is_common_member = false
+                                        for field in enum_.fields {
+                                            let var = .program.get_variable(field.variable_id)
+                                            if var.name == accessor {
+                                                is_common_member = true
+                                                break
+                                            }
+                                        }
+
+                                        if is_common_member {
+                                            output.append(" = __jakt_match_variant.common.init_common.")
+                                            output.append(accessor)
+                                        } else {
+                                            output.append(" = __jakt_match_value.")
+                                            output.append(accessor)
+                                        }
                                         output.append(";\n")
                                     }
                                 }
@@ -3691,7 +3821,12 @@ struct CodeGenerator {
                 }
             }
             Expression(expr) => {
-                if expr.type() == void_type_id() or expr.type() == never_type_id() or (
+
+                if expr is Block(block) {
+                    .codegen_block(block, output)
+                    // NOTE: should not need any guarding
+                    output.append("VERIFY_NOT_REACHED();\n")
+                } else if expr.type() == void_type_id() or expr.type() == never_type_id() or (
                     expr.type() == unknown_type_id() and
                     not expr is OptionalNone
                 ) {
@@ -3726,16 +3861,24 @@ struct CodeGenerator {
         rhs: CheckedExpression
         op: CheckedBinaryOperator
         output: &mut StringBuilder
+        forward_error_with_try: bool = true
     ) throws {
         if op.trait_implementation is Some(implementation) {
+            // Since the binary op is done through a call, then TRY() forwarding
+            // makes sense as the call is now the primary expression.
             .codegen_method_call(
                 expr: lhs
                 call: implementation.call_expression
                 is_optional: false
                 &mut output
+                forward_error_with_try
             )
             return
         }
+
+        // NOTE: We don't propagate `forward_error_with_try` here because none of
+        // the operations here have a way to syntactically replace the TRY()
+        // macro.
 
         if op.op is NoneCoalescing {
             let rhs_type_id = rhs.type()
@@ -3789,12 +3932,12 @@ struct CodeGenerator {
             let lhs_string = lhs_builder.to_string()
             let rhs_string = rhs_builder.to_string()
             let var = .fresh_var()
-            output.append(format(
+            output.appendff(
                 "({{ auto&& {0} = {1}; if (!{0}.has_value()) {0} = {2}; }})"
                 var
                 lhs_string
                 rhs_string
-            ))
+            )
             return
         }
 
@@ -4009,9 +4152,10 @@ struct CodeGenerator {
         call: CheckedCall
         is_optional: bool
         output: &mut StringBuilder
+        forward_error_with_try: bool = true
     ) throws {
         if call.callee_throws {
-            output.append(.current_error_handler())
+            output.append(.current_error_handler(forward_error_with_try))
             output.append("((")
         }
 
@@ -4127,7 +4271,7 @@ struct CodeGenerator {
                 for gen_param in generic_parameters {
                     types.push(.codegen_type_possibly_as_namespace(type_id: gen_param, as_namespace: false))
                 }
-                output.append(format("<{}>", join(types, separator: ", ")))
+                output.appendff("<{}>", join(types, separator: ", "))
             }
         }
 
@@ -4191,18 +4335,18 @@ struct CodeGenerator {
         }
     }
 
-    fn codegen_call(mut this, call: CheckedCall, output: &mut StringBuilder) throws {
+    fn codegen_call(mut this, call: CheckedCall, output: &mut StringBuilder, forward_error_with_try: bool = true) throws {
         if call.function_id.has_value() and .program.get_function(call.function_id!).is_comptime {
-            output.append(format(
+            output.appendff(
                 "fail_comptime_call<{}, \"Comptime function {} called outside Jakt compiler\">()"
                 .codegen_type(call.return_type)
                 call.name
-            ))
+            )
             return
         }
 
         if call.callee_throws {
-            output.append(.current_error_handler())
+            output.append(.current_error_handler(forward_error_with_try))
             output.append("((")
         }
         match call.name {
@@ -4243,7 +4387,8 @@ struct CodeGenerator {
                                 let struct_ = .program.get_struct(struct_id)
                                 if struct_.record_type is Class {
                                     output.append(call.name_for_codegen().as_name_for_use())
-                                    output.append("::__jakt_create")
+                                    output.append("::")
+                                    output.append(struct_.create_function_name ?? "__jakt_create")
                                 } else {
                                     output.append(call.name_for_codegen().as_name_for_use())
                                 }
@@ -4262,7 +4407,8 @@ struct CodeGenerator {
                                         }
                                         output.append(.codegen_type(arg))
                                     }
-                                    output.append(">::__jakt_create")
+                                    output.append(">::")
+                                    output.append(struct_.create_function_name ?? "__jakt_create")
                                 } else {
                                     output.append(call.name_for_codegen().as_name_for_use())
                                     output.append("<")
@@ -4315,7 +4461,7 @@ struct CodeGenerator {
                     for gen_param in generic_parameters {
                         types.push(.codegen_type_possibly_as_namespace(type_id: gen_param, as_namespace: false))
                     }
-                    output.append(format("<{}>", join(types, separator: ", ")))
+                    output.appendff("<{}>", join(types, separator: ", "))
                 }
 
                 mut arguments: [String] = []
@@ -4325,7 +4471,7 @@ struct CodeGenerator {
                     arguments.push(builder.to_string())
                 }
 
-                output.append(format("({})", join(arguments, separator: ",")))
+                output.appendff("({})", join(arguments, separator: ","))
             }
         }
 
@@ -4378,23 +4524,6 @@ struct CodeGenerator {
     }
 
     fn codegen_block(mut this, block: CheckedBlock, output: &mut StringBuilder) throws {
-        if block.yielded_type.has_value() {
-            let yielded_type = block.yielded_type!
-            let type_output = .codegen_type(yielded_type)
-            let fresh_var = .fresh_var()
-            let fresh_label = .fresh_label()
-
-            .entered_yieldable_blocks.push((fresh_var, fresh_label))
-
-            if not yielded_type.equals(void_type_id()) {
-                output.append("({ Optional<")
-                output.append(type_output)
-                output.append("> ")
-                output.append(fresh_var)
-                output.append("; ")
-            }
-        }
-
         output.append("{\n")
 
         for statement in block.statements {
@@ -4402,20 +4531,6 @@ struct CodeGenerator {
         }
 
         output.append("}\n")
-
-        if block.yielded_type.has_value() {
-            let (var, label) = .entered_yieldable_blocks.pop()!
-
-            output.append(label)
-            output.append(":; ")
-            if not block.yielded_type!.equals(void_type_id()) {
-                output.append(var)
-                if not block.yielded_none {
-                    output.append(".release_value()")
-                }
-                output.append("; })")
-            }
-        }
     }
 
     fn codegen_statement(
@@ -4425,7 +4540,7 @@ struct CodeGenerator {
     ) throws {
         mut add_newline = true
         if .debug_info.statement_span_comments and statement.span().has_value() and add_newline {
-            output.append(format("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!)))
+            output.appendff("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!))
         }
 
         match statement {
@@ -4476,8 +4591,9 @@ struct CodeGenerator {
                             .codegen_expression(val!, &mut output)
                             output.append("; return {}")
                         } else {
+                            // Disable forwarding with TRY because we're returning an ErrorOr<Ret> too!
                             output.append("return ")
-                            .codegen_expression(val!, &mut output)
+                            .codegen_expression(val!, &mut output, forward_error_with_try: false)
                         }
 
                         output.append(";")
@@ -4497,7 +4613,7 @@ struct CodeGenerator {
             }
             Loop(block) => {
                 if .debug_info.statement_span_comments and statement.span().has_value() {
-                    output.append(format("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!)))
+                    output.appendff("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!))
                 }
                 output.append("for (;;)")
                 add_newline = false
@@ -4508,7 +4624,7 @@ struct CodeGenerator {
             }
             While(condition, block) => {
                 if .debug_info.statement_span_comments and statement.span().has_value() {
-                    output.append(format("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!)))
+                    output.appendff("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!))
                 }
                 output.append("while (")
                 .codegen_expression(expression: condition, &mut output)
@@ -4558,7 +4674,7 @@ struct CodeGenerator {
             }
             If(condition, then_block, else_statement) => {
                 if .debug_info.statement_span_comments and statement.span().has_value() {
-                    output.append(format("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!)))
+                    output.appendff("\n#line {}\n", .debug_info.span_to_source_location(statement.span()!))
                 }
                 output.append("if (")
                 .codegen_expression(condition, &mut output)
@@ -4574,24 +4690,32 @@ struct CodeGenerator {
                 add_newline = false
             }
             Yield(expr, span) => {
-                if .entered_yieldable_blocks.size() == 0 {
-                    panic("Must be in a block to yield")
-                }
-
-                let (var_name, end_label) = .entered_yieldable_blocks.last()!
-
-                if expr.has_value() {
-                    if expr!.type() != void_type_id() {
-                        output.append(var_name)
-                        output.append(" = ")
+                let is_void = expr.has_value() and expr!.type() == void_type_id()
+                match .yield_method! {
+                    ReturnExplicitValue(ctor) => {
+                        if is_void {
+                            .codegen_statement(statement: CheckedStatement::Expression(expr: expr!, span), &mut output)
+                        }
+                        output.append("return ")
+                        output.append(ctor)
+                        output.append('(')
+                        if not is_void and expr is Some(value) {
+                            .codegen_expression(value, &mut output)
+                        }
+                        output.append(");")
                     }
-
-                    .codegen_expression(expr!, &mut output)
+                    AssignAndGoto(name, label) => {
+                        if not is_void and expr.has_value() {
+                            output.append(name)
+                            output.append(" = ")
+                            .codegen_expression(expr!, &mut output)
+                            output.append("; ")
+                        }
+                        output.append("goto ")
+                        output.append(label)
+                        output.append(";\n")
+                    }
                 }
-
-                output.append("; goto ")
-                output.append(end_label)
-                output.append(";\n")
             }
         }
 
@@ -4979,9 +5103,9 @@ struct CodeGenerator {
         }
 
         if is_inline {
-            output.append(format("~{}()", struct_.name_for_codegen().as_name_for_definition()))
+            output.appendff("~{}()", struct_.name_for_codegen().as_name_for_definition())
         } else {
-            output.append(format("{}::~{}()", qualified_name, struct_.name_for_codegen().as_name_for_definition()))
+            output.appendff("{}::~{}()", qualified_name, struct_.name_for_codegen().as_name_for_definition())
         }
 
         .codegen_block(block: function.block, &mut output)
@@ -5004,7 +5128,7 @@ struct CodeGenerator {
         if structure.record_type is Class {
             output.append("protected:\n")
 
-            output.append(format("explicit {}(", function.name_for_codegen().as_name_for_definition()))
+            output.appendff("explicit {}(", function.name_for_codegen().as_name_for_definition())
             mut first = true
             for param in function.params {
                 if not first {
@@ -5039,7 +5163,7 @@ struct CodeGenerator {
             }
 
             output.append("public:\n")
-            output.append(format("static NonnullRefPtr<{}> __jakt_create", class_name_with_generics))
+            output.appendff("static NonnullRefPtr<{}> {}", class_name_with_generics, structure.create_function_name ?? "__jakt_create")
             output.append("(")
 
             first = true
@@ -5105,7 +5229,7 @@ struct CodeGenerator {
                 output.append(function.name_for_codegen().as_name_for_definition())
                 output.append("(")
             } else {
-                output.append(format("{}::{}(", qualified_name, function.name_for_codegen().as_name_for_definition()))
+                output.appendff("{}::{}(", qualified_name, function.name_for_codegen().as_name_for_definition())
             }
 
             mut first = true
@@ -5181,7 +5305,7 @@ struct CodeGenerator {
                     true => ""
                     false => qualified_name + "::"
                 }
-                output.append(format("NonnullRefPtr<{}> {}__jakt_create", class_name_with_generics, qualified_namespace))
+                output.appendff("NonnullRefPtr<{}> {}{}", class_name_with_generics, qualified_namespace, structure.create_function_name ?? "__jakt_create")
                 output.append("(")
 
                 first = true
@@ -5197,7 +5321,7 @@ struct CodeGenerator {
                     output.append(param.variable.name_for_codegen().as_name_for_definition())
                 }
 
-                output.append(format(") {{ auto o = adopt_ref(*new {} (", class_name_with_generics))
+                output.appendff(") {{ auto o = adopt_ref(*new {} (", class_name_with_generics)
 
                 first = true
                 for param in function.params {
@@ -5269,11 +5393,9 @@ struct CodeGenerator {
         explicit_generic_instantiation: [TypeId]? = None
         output: &mut StringBuilder
     ) throws {
-        // Extern generics need to be in the header anyways, so we can't codegen for them.
-        if not function.generics.params.is_empty() {
-            if function.linkage is External {
-                return
-            }
+        // No need to generate code for external functions
+        if function.linkage is External {
+            return
         }
 
         if function.force_inline is ForceInline {
@@ -5299,7 +5421,7 @@ struct CodeGenerator {
             if as_method and function.is_static() {
                 output.append("static ")
             }
-            if not function.type is Destructor {
+            if not function.type is Destructor and not function.type is Constructor {
                 output.append(match function.can_throw {
                     true => format("ErrorOr<{}>", .codegen_type(function.return_type_id))
                     false => .codegen_type(function.return_type_id)

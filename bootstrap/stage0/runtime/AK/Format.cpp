@@ -28,10 +28,6 @@
 #    include <time.h>
 #endif
 
-#if defined(AK_OS_ANDROID)
-#    include <android/log.h>
-#endif
-
 #ifndef KERNEL
 #    include <AK/StringFloatingPointConversions.h>
 #endif
@@ -125,10 +121,10 @@ StringView FormatParser::consume_literal()
     auto const begin = tell();
 
     while (!is_eof()) {
-        if (consume_specific("{{"))
+        if (consume_specific("{{"sv))
             continue;
 
-        if (consume_specific("}}"))
+        if (consume_specific("}}"sv))
             continue;
 
         if (next_is(is_any_of("{}"sv)))
@@ -752,7 +748,7 @@ ErrorOr<void> FormatBuilder::put_hexdump(ReadonlyBytes bytes, size_t width, char
 {
     auto put_char_view = [&](auto i) -> ErrorOr<void> {
         TRY(put_padding(fill, 4));
-        for (size_t j = i - width; j < i; ++j) {
+        for (size_t j = i - min(i, width); j < i; ++j) {
             auto ch = bytes[j];
             TRY(m_builder.try_append(ch >= 32 && ch <= 127 ? ch : '.')); // silly hack
         }
@@ -769,7 +765,7 @@ ErrorOr<void> FormatBuilder::put_hexdump(ReadonlyBytes bytes, size_t width, char
         TRY(put_u64(bytes[i], 16, false, false, true, false, Align::Right, 2));
     }
 
-    if (width > 0 && bytes.size() && bytes.size() % width == 0)
+    if (width > 0)
         TRY(put_char_view(bytes.size()));
 
     return {};
@@ -858,7 +854,7 @@ void StandardFormatter::parse(TypeErasedFormatParams& params, FormatParser& pars
         m_mode = Mode::Hexfloat;
     else if (parser.consume_specific('A'))
         m_mode = Mode::HexfloatUppercase;
-    else if (parser.consume_specific("hex-dump"))
+    else if (parser.consume_specific("hex-dump"sv))
         m_mode = Mode::HexDump;
 
     if (!parser.is_eof())
@@ -1090,45 +1086,6 @@ void vout(FILE* file, StringView fmtstr, TypeErasedFormatParams& params, bool ne
 }
 #endif
 
-#ifdef AK_OS_ANDROID
-static char const* s_log_tag_name = "Serenity";
-void set_log_tag_name(char const* tag_name)
-{
-    static String s_log_tag_storage;
-    // NOTE: Make sure to copy the null terminator
-    s_log_tag_storage = MUST(String::from_utf8({ tag_name, strlen(tag_name) + 1 }));
-    s_log_tag_name = s_log_tag_storage.bytes_as_string_view().characters_without_null_termination();
-}
-
-void vout(LogLevel log_level, StringView fmtstr, TypeErasedFormatParams& params, bool newline)
-{
-    StringBuilder builder;
-    MUST(vformat(builder, fmtstr, params));
-
-    if (newline)
-        builder.append('\n');
-    builder.append('\0');
-
-    auto const string = builder.string_view();
-
-    auto ndk_log_level = ANDROID_LOG_UNKNOWN;
-    switch (log_level) {
-    case LogLevel ::Debug:
-        ndk_log_level = ANDROID_LOG_DEBUG;
-        break;
-    case LogLevel ::Info:
-        ndk_log_level = ANDROID_LOG_INFO;
-        break;
-    case LogLevel::Warning:
-        ndk_log_level = ANDROID_LOG_WARN;
-        break;
-    }
-
-    __android_log_write(ndk_log_level, s_log_tag_name, string.characters_without_null_termination());
-}
-
-#endif
-
 #ifndef KERNEL
 // FIXME: Deduplicate with Core::Process:get_name()
 [[gnu::used]] static ByteString process_name_helper()
@@ -1139,7 +1096,7 @@ void vout(LogLevel log_level, StringView fmtstr, TypeErasedFormatParams& params,
     if (rc != 0)
         return ByteString {};
     return StringView { buffer, strlen(buffer) };
-#    elif defined(AK_LIBC_GLIBC) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+#    elif defined(AK_LIBC_GLIBC) || defined(AK_OS_LINUX)
     return StringView { program_invocation_name, strlen(program_invocation_name) };
 #    elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU)
     auto const* progname = getprogname();
@@ -1215,15 +1172,15 @@ void vdbg(StringView fmtstr, TypeErasedFormatParams& params, bool newline)
             struct timespec ts = {};
             clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
             auto pid = getpid();
-#    ifndef AK_OS_MACOS
-            // Darwin doesn't handle thread IDs the same way other Unixes do
+#    if defined(AK_OS_SERENITY) || defined(AK_OS_LINUX)
+            // Linux and Serenity handle thread IDs as if they are related to process ids
             auto tid = gettid();
             if (pid == tid)
 #    endif
             {
                 builder.appendff("{}.{:03} \033[33;1m{}({})\033[0m: ", ts.tv_sec, ts.tv_nsec / 1000000, process_name, pid);
             }
-#    ifndef AK_OS_MACOS
+#    if defined(AK_OS_SERENITY) || defined(AK_OS_LINUX)
             else {
                 builder.appendff("{}.{:03} \033[33;1m{}({}:{})\033[0m: ", ts.tv_sec, ts.tv_nsec / 1000000, process_name, pid, tid);
             }
@@ -1235,9 +1192,6 @@ void vdbg(StringView fmtstr, TypeErasedFormatParams& params, bool newline)
     MUST(vformat(builder, fmtstr, params));
     if (newline)
         builder.append('\n');
-#ifdef AK_OS_ANDROID
-    builder.append('\0');
-#endif
     auto const string = builder.string_view();
 
 #ifdef AK_OS_SERENITY
@@ -1248,11 +1202,7 @@ void vdbg(StringView fmtstr, TypeErasedFormatParams& params, bool newline)
     }
 #    endif
 #endif
-#ifdef AK_OS_ANDROID
-    __android_log_write(ANDROID_LOG_DEBUG, s_log_tag_name, string.characters_without_null_termination());
-#else
     dbgputstr(string.characters_without_null_termination(), string.length());
-#endif
 }
 
 #ifdef KERNEL

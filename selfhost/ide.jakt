@@ -59,19 +59,19 @@ struct JaktSymbol {
     fn to_json(this) -> String {
         mut json_builder = StringBuilder::create()
         json_builder.append("{")
-        json_builder.append(format("\"name\": \"{}\",", this.name))
+        json_builder.appendff("\"name\": \"{}\",", this.name)
         if this.detail.has_value() {
-            json_builder.append(format("\"detail\": \"{}\",", this.detail))
+            json_builder.appendff("\"detail\": \"{}\",", this.detail)
         }
-        json_builder.append(format("\"kind\": \"{}\",", this.kind))
-        json_builder.append(format("\"range\": {{\"start\": {}, \"end\": {}}},", this.range.start, this.range.end))
-        json_builder.append(format("\"selection_range\": {{\"start\": {}, \"end\": {}}},", this.selection_range.start, this.selection_range.end))
+        json_builder.appendff("\"kind\": \"{}\",", this.kind)
+        json_builder.appendff("\"range\": {{\"start\": {}, \"end\": {}}},", this.range.start, this.range.end)
+        json_builder.appendff("\"selection_range\": {{\"start\": {}, \"end\": {}}},", this.selection_range.start, this.selection_range.end)
         mut child_symbols : [String] = []
         child_symbols.ensure_capacity(this.children.size())
         for child in this.children {
             child_symbols.push(child.to_json())
         }
-        json_builder.append(format("\"children\": [{}]", join(child_symbols, separator: ",")))
+        json_builder.appendff("\"children\": [{}]", join(child_symbols, separator: ","))
         json_builder.append("}")
         return json_builder.to_string()
     }
@@ -316,41 +316,49 @@ fn find_typename_in_program(program: CheckedProgram, span: Span) throws -> Strin
 }
 
 fn completions_for_type_id(program: CheckedProgram, type_id: TypeId) throws -> [String] {
-    mut output: [String] = []
+    mut output: {String} = {}
     let ty = program.get_type(type_id)
 
     match ty {
         Enum(enum_id) => {
             let enum_ = program.get_enum(enum_id)
             let scope = program.get_scope(enum_.scope_id)
-            output.push_values(&find_function_completions_in_scope(scope, program))
+            for entry in find_function_completions_in_scope(scope, program) {
+                output.add(entry)
+            }
         }
-        Struct(struct_id) => {
-            let structure = program.get_struct(struct_id)
-
-            for field in structure.fields {
-                let field_var = program.get_variable(field.variable_id)
-                output.push(field_var.name)
+        GenericInstance(id: struct_id) | Struct(struct_id) => {
+            mut structs: [CheckedStruct] = [program.get_struct(struct_id)]
+            loop {
+                if structs.last()!.super_struct_id is Some(x) {
+                    structs.push(program.get_struct(x))
+                } else {
+                    break
+                }
             }
 
-            let scope = program.get_scope(structure.scope_id)
-            output.push_values(&find_function_completions_in_scope(scope, program))
-        }
-        GenericInstance(id: struct_id) => {
-            let structure = program.get_struct(struct_id)
+            for structure in structs {
+                let scope = program.get_scope(structure.scope_id)
 
-            for field in structure.fields {
-                let field_var = program.get_variable(field.variable_id)
-                output.push(field_var.name)
+                for field in structure.fields {
+                    let field_var = program.get_variable(field.variable_id)
+                    output.add(field_var.name)
+                }
+                for entry in find_function_completions_in_scope(scope, program) {
+                    output.add(entry)
+                }
             }
 
-            let scope = program.get_scope(structure.scope_id)
-            output.push_values(&find_function_completions_in_scope(scope, program))
         }
         else => {}
     }
 
-    return output
+    mut result: [String] = []
+    for entry in output {
+        result.push(entry)
+    }
+
+    return result
 }
 
 fn find_function_completions_in_scope(anon scope: Scope, program: CheckedProgram) throws -> [String] {

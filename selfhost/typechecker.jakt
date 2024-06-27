@@ -23,9 +23,9 @@ import types {
     CheckedQualifiers, CheckedStatement, CheckedStringLiteral, CheckedStruct, CheckedTrait, CheckedTypeCast
     CheckedUnaryOperator, CheckedVariable, CheckedVisibility, ClassInstanceRebind, EnumId, FieldRecord
     FunctionGenericParameter, FunctionGenerics, FunctionId, GenericInferences, IterationDecision, LoadedModule
-    MaybeResolvedScope, Module, ModuleId, NumberConstant, OperatorTraitImplementation, ResolvedNamespace, SafetyMode
-    Scope, ScopeId, SpecializedType, StringLiteral, StructId, StructLikeId, TraitId, Type, TypeId, Value, VarId
-    builtin, comptime_format_impl, never_type_id, unknown_type_id, void_type_id
+    MaybeResolvedScope, Module, ModuleId, NumberConstant, OperatorTraitImplementation, ResolutionMixin
+    ResolvedNamespace, SafetyMode, Scope, ScopeId, SpecializedType, StringLiteral, StructId, StructLikeId, TraitId
+    Type, TypeId, Value, VarId, builtin, comptime_format_impl, never_type_id, unknown_type_id, void_type_id
 }
 import types
 import utility { FileId, Span, add_arrays, escape_for_quotes, join, panic, todo, map, write_to_file }
@@ -220,6 +220,10 @@ struct Typechecker {
 
         let PRELUDE_SCOPE_ID: ScopeId = typechecker.prelude_scope_id()
         let root_scope_id = typechecker.create_scope(parent_scope_id: PRELUDE_SCOPE_ID, can_throw: false, debug_name: "root", for_block: false)
+        let main_scope_id = typechecker.create_scope(parent_scope_id: root_scope_id, can_throw: false, debug_name: "anon(main-file)", for_block: false)
+        mut root_scope = typechecker.get_scope(root_scope_id)
+        root_scope.children.push(main_scope_id)
+
         typechecker.typecheck_module_import(
             import_: ParsedModuleImport(
                 module_name: ImportName::Literal(
@@ -256,7 +260,7 @@ struct Typechecker {
             )
         }
 
-        typechecker.typecheck_module(parsed_namespace, scope_id: root_scope_id)
+        typechecker.typecheck_module(parsed_namespace, scope_id: main_scope_id)
 
         return typechecker
     }
@@ -1438,7 +1442,7 @@ struct Typechecker {
                 // Anonymous namespace to ensure imported symbols don't clash with prelude symbols.
                 // (unless the imported namespace is actually named)
                 mut scope = .get_scope(scope_id)
-                scope.resolution_mixins.push(import_scope_id)
+                scope.resolution_mixins.push(ResolutionMixin(scope_id: import_scope_id))
                 if extern_import.assigned_namespace.name.has_value() {
                     .get_scope(import_scope_id).namespace_name = extern_import.assigned_namespace.name!
                     .get_scope(import_scope_id).external_name = ExternalName::Plain("") // global ns
@@ -1462,7 +1466,7 @@ struct Typechecker {
                 // Anonymous namespace to ensure imported symbols don't clash with prelude symbols.
                 // (unless the imported namespace is actually named)
                 mut scope = .get_scope(scope_id)
-                scope.resolution_mixins.push(child_scope_id)
+                scope.resolution_mixins.push(ResolutionMixin(scope_id: child_scope_id))
             }
             .typecheck_auto_extern_imports(coalesced_imports, child_scope_id)
         }
@@ -1489,21 +1493,21 @@ struct Typechecker {
 
             for action in import_.before_include {
                 match action {
-                    Define(name, value) => builder.append(format("#define {} {}\n", name, value))
-                    Undefine(name) => builder.append(format("#undef {}\n", name))
+                    Define(name, value) => builder.appendff("#define {} {}\n", name, value)
+                    Undefine(name) => builder.appendff("#undef {}\n", name)
                 }
             }
             if import_.is_c {
                 builder.append("extern \"C\" {\n")
             }
-            builder.append(format("#include <{}>\n", import_.get_path()))
+            builder.appendff("#include <{}>\n", import_.get_path())
             if import_.is_c {
                 builder.append("}\n")
             }
             for action in import_.after_include {
                 match action {
-                    Define(name, value) => builder.append(format("#define {} {}\n", name, value))
-                    Undefine(name) => builder.append(format("#undef {}\n", name))
+                    Define(name, value) => builder.appendff("#define {} {}\n", name, value)
+                    Undefine(name) => builder.appendff("#undef {}\n", name)
                 }
             }
         }
@@ -1865,13 +1869,25 @@ struct Typechecker {
             }
             debug_name += ")"
 
-            mut existing_scope_id = match namespace_.name.has_value() {
-                true => .find_namespace_in_scope(scope_id: scope_id, name: namespace_.name!)?.0
-                false => None
+            mut (existing_scope_id, existing_scope_is_imported) = match namespace_.name.has_value() {
+                true => {
+                    let result = .find_namespace_in_scope(scope_id: scope_id, name: namespace_.name!)
+                    yield (result?.0, result?.1 ?? false)
+                }
+                false => (None, false)
             }
 
             mut namespace_scope_id = existing_scope_id
-            if not existing_scope_id.has_value() {
+            if existing_scope_id.has_value() {
+                // if the namespace is actually pointing to an imported module, this whole thing is in a seriously bad state
+                // Just throw an error and continue - imports will also error out later.
+                if existing_scope_is_imported {
+                    .error(
+                        format("Invalid extension of imported namespace '{}'", namespace_.name!)
+                        namespace_.name_span ?? namespace_.keyword_span
+                    )
+                }
+            } else {
                 if namespace_.import_path_if_extern.has_value() {
                     debug_name += " (extern "
                     debug_name += namespace_.import_path_if_extern!
@@ -1903,7 +1919,7 @@ struct Typechecker {
 
                 // Make sure the imported ns can see the "logical" parent ns.
                 if namespace_.import_path_if_extern.has_value() {
-                    child_scope.resolution_mixins.push(scope_id)
+                    child_scope.resolution_mixins.push(ResolutionMixin(scope_id))
                 }
 
                 namespace_scope_id = child_scope_id
@@ -2050,7 +2066,7 @@ struct Typechecker {
 
                 mut parent_scope = .get_scope(scope_id)
                 parent_scope.children.push(namespace_scope_id)
-                parent_scope.resolution_mixins.push(namespace_scope_id)
+                parent_scope.resolution_mixins.push(ResolutionMixin(scope_id: namespace_scope_id))
 
                 .typecheck_namespace_predecl(parsed_namespace: chunk_namespace, scope_id: namespace_scope_id)
                 resolved_chunk.generated_scopes.push(namespace_scope_id)
@@ -2108,6 +2124,7 @@ struct Typechecker {
                     generic_argument: type_id
                     constraints: traits
                     arg_span: span
+                    scope_id
                 )
                 let matches = not .had_an_error
                 .had_an_error = false
@@ -2303,7 +2320,7 @@ struct Typechecker {
                     parsed_function: method.parsed_function
                     parent_scope_id: entity_scope_id
                     this_arg_type_id
-                    scope_mixin: scope_id
+                    scope_mixin: ResolutionMixin(scope_id)
                 )
             }
         }
@@ -2938,7 +2955,7 @@ struct Typechecker {
                 for_block: false
             )
             mut scope = .get_scope(scope_id)
-            scope.resolution_mixins.push(aliased_scope_id)
+            scope.resolution_mixins.push(ResolutionMixin(scope_id: aliased_scope_id))
         }
 
         let trait_name_scope_id = trait_name_scope_id_override ?? scope_id
@@ -3078,6 +3095,7 @@ struct Typechecker {
             type_id: struct_type_id
             super_struct_id
             external_name: parsed_record.external_name
+            create_function_name: parsed_record.create_function_name
         )
 
         mut generic_parameters: [CheckedGenericParameter] = module.structures[struct_id.id].generic_parameters
@@ -3226,6 +3244,7 @@ struct Typechecker {
             record_type: parsed_record.record_type
             type_id: struct_type_id
             external_name: parsed_record.external_name
+            create_function_name: parsed_record.create_function_name
         ))
 
         match parsed_record.record_type {
@@ -3355,7 +3374,10 @@ struct Typechecker {
                         parsed_function: method.parsed_function!
                         parent_scope_id: scope_id
                         this_arg_type_id: type_id
-                        scope_mixin: mixin_scope_id
+                        scope_mixin: match mixin_scope_id.has_value() {
+                            true => ResolutionMixin(scope_id: mixin_scope_id!)
+                            false => None
+                        }
                     )
                 }
             }
@@ -4195,7 +4217,7 @@ struct Typechecker {
         parent_scope_id: ScopeId
         this_arg_type_id: TypeId?
         mut generics: FunctionGenerics? = None
-        scope_mixin: ScopeId? = None
+        scope_mixin: ResolutionMixin? = None
     ) throws -> FunctionId {
         let function_scope_id = .create_scope(parent_scope_id, can_throw: parsed_function.can_throw, debug_name: format("fn({})", parsed_function.name))
         if scope_mixin.has_value() {
@@ -4444,7 +4466,13 @@ struct Typechecker {
         }
     }
 
-    fn check_type_argument_requirements(mut this, generic_argument: TypeId, constraints: [TraitId], arg_span: Span) throws {
+    fn check_type_argument_requirements(
+        mut this
+        generic_argument: TypeId
+        constraints: [TraitId]
+        arg_span: Span
+        scope_id: ScopeId
+    ) throws {
         // if the parameter has no trait requirements, then it's OK
         guard not constraints.is_empty() else {
             return
@@ -4505,6 +4533,7 @@ struct Typechecker {
                             .find_or_add_type_id(Type::Self): generic_argument
                         ]
                         compiler: .compiler
+                        runtime_scope_id: scope_id
                     )
                     let result = try interpreter.execute_expression(expr, scope)
                     mut meets_requirement = false
@@ -4621,7 +4650,9 @@ struct Typechecker {
                 .check_type_argument_requirements(
                     generic_argument: generic_arguments[i],
                     constraints: checked_function.generics.params[i].checked_parameter.constraints,
-                    arg_span)
+                    arg_span,
+                    scope_id
+                )
             }
         }
 
@@ -4850,71 +4881,53 @@ struct Typechecker {
 
         checked_function.block = block
         checked_function.return_type_id = return_type_id
-        .current_function_id = None
-    }
 
-    fn statement_control_flow(this, anon statement: CheckedStatement) -> BlockControlFlow => match statement {
-        Return => BlockControlFlow::AlwaysReturns
-        Throw => BlockControlFlow::AlwaysReturns
-        Break => BlockControlFlow::AlwaysTransfersControl(might_break: true)
-        Continue => BlockControlFlow::AlwaysTransfersControl(might_break: false)
-        Yield(expr) => match expr.has_value() {
-            true => expr!.control_flow().updated(BlockControlFlow::AlwaysTransfersControl(might_break: false))
-            false => BlockControlFlow::AlwaysTransfersControl(might_break: false)
-        }
-        If(condition, then_block, else_statement) => match condition {
-            Boolean(val) => match val {
-                true => then_block.control_flow
-                false => match else_statement.has_value() {
-                    true => .statement_control_flow(else_statement!)
-                    false => BlockControlFlow::MayReturn
-                }
-            }
-            // Note that a missing 'else' branch produces a partial result.
-            else => then_block.control_flow.branch_unify_with(.maybe_statement_control_flow(else_statement, then_block.control_flow))
-        }
-        Block(block) => block.control_flow
-        // Note that 'while' blocks, which conditions are not always true,
-        // similarly to 'if's with a missing 'else' branch, produce a partial result.
-        // But also: every 'break' and 'continue' inside of it, does not apply to the outer blocks,
-        // and without a need for that info, Partials can just get degraded to the MayReturn.
-        While(condition, block) => match condition {
-            Boolean(val) => match val {
-                true => match block.control_flow {
-                    AlwaysReturns => BlockControlFlow::AlwaysReturns
-                    NeverReturns => BlockControlFlow::NeverReturns
-                    else => BlockControlFlow::MayReturn
-                }
-                else => BlockControlFlow::MayReturn
-            }
-            else => BlockControlFlow::MayReturn
-        }
-        Loop(block) => match block.control_flow {
-            AlwaysTransfersControl(might_break) => match might_break {
-                false => BlockControlFlow::AlwaysTransfersControl(might_break)
-                true => BlockControlFlow::MayReturn
-            }
-            NeverReturns => BlockControlFlow::NeverReturns
-            AlwaysReturns => BlockControlFlow::AlwaysReturns
-            MayReturn => BlockControlFlow::MayReturn
-            else => match block.control_flow.may_break() {
-                true => BlockControlFlow::MayReturn
-                // Loop will always continue, so upgrade partial results to full ones
-                false => match block.control_flow {
-                    PartialAlwaysReturns => BlockControlFlow::AlwaysReturns
-                    PartialNeverReturns => BlockControlFlow::NeverReturns
-                    PartialAlwaysTransfersControl(might_break) => BlockControlFlow::AlwaysTransfersControl(might_break)
-                    else => BlockControlFlow::MayReturn // unreachable, logically.
-                }
-            }
-        }
-        Expression(expr) => expr.control_flow()
-        else => BlockControlFlow::MayReturn
-    }
+        defer .current_function_id = None
 
-    fn maybe_statement_control_flow(this, anon statement: CheckedStatement?, anon other_branch: BlockControlFlow) -> BlockControlFlow => match statement.has_value() {
-        true => .statement_control_flow(statement!)
-        false => other_branch.partial()
+        if parsed_function.is_raw_constructor {
+            // raw_constructor() only applies to functions with the signature `fn(this: mut Self, ..) -> void`
+            // and specifically allowed only in classes.
+            if .self_type_id is None {
+                .error("Invalid use of raw_constructor outside of a class", parsed_function.name_span)
+                return
+            }
+
+            let self_type_id = .self_type_id!
+            let self_type = .get_type(self_type_id)
+            let struct_ = match self_type {
+                Struct(id) => .get_struct(id)
+                else => {
+                    .error("Invalid use of raw_constructor outside of a class", parsed_function.name_span)
+                    return
+                }
+            }
+
+            guard struct_.record_type is Class else {
+                .error("Invalid use of raw_constructor on a non-class type", parsed_function.name_span)
+                return
+            }
+
+            // Check the return type
+            if not return_type_id.equals(void_type_id()) {
+                .error("raw_constructor class must return void", parsed_function.return_type_span)
+            }
+
+            // Check the parameters
+            if parsed_function.params.size() < 1 {
+                .error("raw_constructor class must take at least `this'", parsed_function.name_span)
+                return
+            }
+
+            let this_param = parsed_function.params[0]
+            if this_param.variable.name != "this" {
+                .error("raw_constructor class must take `this' as its first parameter", this_param.variable.span)
+                return
+            }
+
+            // Done, set the external name and the ctor flag.
+            checked_function.external_name = ExternalName::Plain(struct_.name_for_codegen().as_name_for_definition())
+            checked_function.type = FunctionType::Constructor
+        }
     }
 
     fn check_types_for_compat(
@@ -5490,7 +5503,7 @@ struct Typechecker {
                 safety_mode
                 type_hint: yield_type_hint
             )
-            checked_block.control_flow = checked_block.control_flow.updated(.statement_control_flow(checked_statement))
+            checked_block.control_flow = checked_block.control_flow.updated(checked_statement.control_flow())
 
             let yield_span: Span? = match parsed_statement {
                 ParsedStatement::Yield(expr) => match expr.has_value() {
@@ -5898,8 +5911,12 @@ struct Typechecker {
                 &arguments
                 &span
                 this
-            ](scope_id: ScopeId, name_override: String?, is_alias: bool) throws -> IterationDecision<bool> {
-                let scope = .get_scope(scope_id)
+            ](mixin: ResolutionMixin, name_override: String?, is_alias: bool) throws -> IterationDecision<bool> {
+                if not mixin.mixin_types {
+                    return IterationDecision::Continue
+                }
+
+                let scope = .get_scope(mixin.scope_id)
                 if not scope.explicitly_specialized_types.contains(name) {
                     return IterationDecision::Continue
                 }
@@ -8746,13 +8763,16 @@ struct Typechecker {
             return [CheckedEnumVariantBinding(name: None, binding: bindings[0].binding, type_id, span)]
         }
 
-        guard variant is StructLike(fields) else {
-            return None
-        }
         mut checked_vars: [CheckedVariable] = []
         mut checked_enum_variant_bindings: [CheckedEnumVariantBinding] = []
-        for field in fields {
-            checked_vars.push(.get_variable(field))
+        if variant is StructLike(fields) {
+            for field in fields {
+                checked_vars.push(.get_variable(field))
+            }
+        } else {
+            for field in .program.get_enum(variant.enum_id()).fields {
+                checked_vars.push(.get_variable(field.variable_id))
+            }
         }
         for binding in bindings {
             mut found = false
@@ -8882,13 +8902,13 @@ struct Typechecker {
             }
         }
 
-        // if we're not capturing everything, transfer over the types from the parent scopes
+        // if we're not capturing everything, transfer over the types from the parent scopes (everything except variables)
         if not is_capturing_everything {
             mut current_scope_id = scope_id
             mut lambda_scope = .get_scope(lambda_scope_id)
             while not current_scope_id.equals(effective_namespace_parent_scope_id) {
                 let current_scope = .get_scope(current_scope_id)
-                lambda_scope.resolution_mixins.push(current_scope_id)
+                lambda_scope.resolution_mixins.push(ResolutionMixin(scope_id: current_scope_id, mixin_vars: false))
                 current_scope_id = current_scope.parent!
             }
         }
@@ -10616,7 +10636,7 @@ struct Typechecker {
         builder.append(.type_name(function.return_type_id))
 
         if function.specialization_index is Some(index) {
-            builder.append(format(" [specialization {}: <", index))
+            builder.appendff(" [specialization {}: <", index)
             let type_ids = function.generics.specializations[index]
             for i in 0..type_ids.size() {
                 if i != 0 {
@@ -11031,9 +11051,13 @@ struct Typechecker {
                     continue
                 }
 
-                if value is Throw {
+                if value is Throw(err) {
                     .error(
-                        format("Compiletime call failed: {}", value)
+                        comptime_format_impl(
+                            format_string: "Compiletime call failed: {}"
+                            arguments: [err][..]
+                            program: &.program
+                        )
                         argument.1.span()
                     )
                     break
@@ -11068,7 +11092,12 @@ struct Typechecker {
             }
 
             mut result: ExecutionResult? = None
-            mut invocation_scope = InterpreterScope::create(parent: eval_scope, type_bindings, compiler: .compiler)
+            mut invocation_scope = InterpreterScope::create(
+                parent: eval_scope
+                type_bindings
+                compiler: .compiler
+                runtime_scope_id: caller_scope_id
+            )
             try {
                 result = interpreter.execute(
                     function_to_run_id: resolved_function_id!
@@ -11079,7 +11108,10 @@ struct Typechecker {
                     invocation_scope
                 )
             } catch error {
-                .error(format("Compiletime call failed: {}", error), span)
+                .error(
+                    format("Compiletime call failed: {}", error)
+                    span
+                )
                 return checked_call
             }
 
@@ -11087,7 +11119,11 @@ struct Typechecker {
                 Return(x) => value_to_checked_expression(x, interpreter)
                 Throw(x) => {
                     .error(
-                        format("Compiletime call failed: {}", x)
+                        comptime_format_impl(
+                            format_string: "Compiletime call failed: {}"
+                            arguments: [x][..]
+                            program: &.program
+                        )
                         x.span
                     )
                     yield checked_call
@@ -11159,7 +11195,7 @@ struct Typechecker {
                         // Ensure the default value is typechecked with access to the scope it's declared in.
                         mut scope = .get_scope(scope_id)
                         let (expression, default_scope_id) = default_value
-                        scope.resolution_mixins.push(default_scope_id)
+                        scope.resolution_mixins.push(ResolutionMixin(scope_id: default_scope_id))
                         defer scope.resolution_mixins.pop()
                         maybe_checked_expr = .typecheck_expression(
                             expr: expression
@@ -11184,7 +11220,7 @@ struct Typechecker {
                 if param.default_value_expression is Some(default_value) {
                     mut scope = .get_scope(scope_id)
                     let (expression, default_scope_id) = default_value
-                    scope.resolution_mixins.push(default_scope_id)
+                    scope.resolution_mixins.push(ResolutionMixin(scope_id: default_scope_id))
                     defer scope.resolution_mixins.pop()
                     maybe_checked_expr = .typecheck_expression(
                         expr: expression

@@ -1,0 +1,27 @@
+/// Expect:
+/// - output: "shared: 1 other: 2\n"
+
+enum Thing {
+	shared: u32
+
+	Foo(other: u32)
+	Bar
+}
+
+fn do_match(thing: Thing) {
+	match thing {
+		Foo(shared, other) => {
+			println("shared: {} other: {}", shared, other)
+		}
+		else => {}
+	}
+
+	if thing is Bar(shared) {
+		println("should not match, but should compile: {}", shared)
+	}
+}
+
+
+fn main() {
+	do_match(thing: Thing::Foo(shared: 1, other: 2))
+}

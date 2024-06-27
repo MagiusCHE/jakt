@@ -241,7 +241,7 @@ enum IncludeAction {
 
 struct ParsedExternImport {
     is_c: bool = false
-    assigned_namespace: ParsedNamespace = ParsedNamespace()
+    assigned_namespace: ParsedNamespace = ParsedNamespace(keyword_span: Span(file_id: FileId(id: 0), start: 0, end: 0))
     before_include: [IncludeAction] = []
     after_include: [IncludeAction] = []
     should_auto_import: bool = false
@@ -277,6 +277,7 @@ struct ParsedNamespace {
     forall_chunks: [([ParsedGenericParameter], ParsedNamespace)] = []
     is_generated_code: bool = false
     is_auto_extern_imported: bool = false
+    keyword_span: Span
 
     fn is_equivalent_to(this, anon other: ParsedNamespace) -> bool =>
         .name == other.name and .import_path_if_extern == other.import_path_if_extern
@@ -379,10 +380,12 @@ struct ParsedRecord {
     nested_records: [ParsedRecord] = []
 
     external_name: ExternalName? = None
+    create_function_name: String? = None
 }
 
 enum FunctionType {
     Normal
+    Constructor
     Destructor
     ImplicitConstructor
     ImplicitEnumConstructor
@@ -426,12 +429,14 @@ struct ParsedFunction {
     deprecated_message: String? = None // if not None, the function is deprecated
     stores_arguments: [(usize, ArgumentStoreLevel)]? = None // if not None, the function stores the given arguments, extending their lifetime requirements.
     force_inline: InlineState = InlineState::Default
+    is_raw_constructor: bool = false
 
     fn equals(this, anon other: ParsedFunction, ignore_block: bool = false) -> bool {
         if this.name != other.name or
         this.can_throw != other.can_throw or
         this.is_comptime != other.is_comptime or
-        this.is_fat_arrow != other.is_fat_arrow {
+        this.is_fat_arrow != other.is_fat_arrow or
+        this.is_raw_constructor != other.is_raw_constructor {
             return false
         }
 
@@ -1774,7 +1779,7 @@ struct Parser {
     }
 
     public fn parse_namespace(mut this, process_only_one_entity: bool = false) -> ParsedNamespace {
-        mut parsed_namespace = ParsedNamespace()
+        mut parsed_namespace = ParsedNamespace(keyword_span: .current().span())
 
         mut active_attributes: [ParsedAttribute] = []
         mut saw_an_entity = false
@@ -2140,6 +2145,14 @@ struct Parser {
                         continue
                     }
 
+                    guard not parsed_function.is_raw_constructor else {
+                        .error(
+                            "A raw constructor cannot have an external name"
+                            attribute.span
+                        )
+                        continue
+                    }
+
                     if attribute.assigned_value!.starts_with("operator(") and attribute.assigned_value!.ends_with(")") {
                         let operator_name = attribute.assigned_value!.substring(start: 9, length: attribute.assigned_value!.length() - 10)
                         parsed_function.external_name = ExternalName::Operator(name: operator_name)
@@ -2232,6 +2245,25 @@ struct Parser {
                         parsed_function.stores_arguments = stores_arguments
                     }
                 }
+                "raw_constructor" => {
+                    if parsed_function.is_raw_constructor {
+                        .error(
+                            format("The attribute '{}' cannot be applied more than once", attribute.name)
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    if parsed_function.external_name.has_value() {
+                        .error(
+                            "A raw constructor cannot have an external name"
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    parsed_function.is_raw_constructor = true
+                }
                 else => {
                     .error(
                         format("The attribute '{}' does not apply to functions", attribute.name)
@@ -2275,6 +2307,25 @@ struct Parser {
                     }
 
                     parsed_record.external_name = ExternalName::Plain(attribute.assigned_value!)
+                }
+                "create_function" => {
+                    guard attribute.assigned_value.has_value() else {
+                        .error(
+                            format("The attribute '{}' requires a value", attribute.name)
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    if parsed_record.create_function_name.has_value() {
+                        .error(
+                            format("The attribute '{}' cannot be applied more than once", attribute.name)
+                            attribute.span
+                        )
+                        continue
+                    }
+
+                    parsed_record.create_function_name = attribute.assigned_value!
                 }
                 else => {
                     .error(
@@ -3823,7 +3874,7 @@ struct Parser {
                         .index++
                         break
                     }
-                    if not error {
+                    if not error and not result.has_varargs {
                         .error("Expected parameter", .current().span())
                         error = true
                     }

@@ -20,7 +20,7 @@ namespace AK {
 
 inline void fill_with_random([[maybe_unused]] Bytes bytes)
 {
-#if defined(AK_OS_SERENITY) || defined(AK_OS_ANDROID) || defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU) || AK_LIBC_GLIBC_PREREQ(2, 36)
+#if defined(AK_OS_SERENITY) || defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU) || AK_LIBC_GLIBC_PREREQ(2, 36)
     arc4random_buf(bytes.data(), bytes.size());
 #elif defined(OSS_FUZZ)
 #else
@@ -60,6 +60,7 @@ inline T get_random()
 }
 
 u32 get_random_uniform(u32 max_bounds);
+u64 get_random_uniform_64(u64 max_bounds);
 
 template<typename Collection>
 inline void shuffle(Collection& collection)
